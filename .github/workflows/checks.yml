@@ -1,0 +1,32 @@
+name: Checks
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: shellcheck bin/vpn install.sh configure.sh tests/integration.sh
+      - run: sh -n bin/vpn && sh -n install.sh && sh -n configure.sh
+  integration:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - image: ghcr.io/openwrt/rootfs:x86_64-24.10.8
+            packages: opkg update && opkg install wireguard-tools qrencode
+          - image: ghcr.io/openwrt/rootfs:x86_64-25.12.5
+            packages: apk update && apk add wireguard-tools qrencode
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run in disposable OpenWrt rootfs
+        env:
+          IMAGE: ${{ matrix.image }}
+          PACKAGES: ${{ matrix.packages }}
+        run: |
+          docker run --rm --platform linux/x86_64 --user root -e VPN_TEST_CONTAINER=1 \
+            -v "$PWD:/src:ro" --entrypoint /bin/sh "$IMAGE" \
+            -c "mkdir -p /var/lock && $PACKAGES && sh /src/tests/integration.sh"

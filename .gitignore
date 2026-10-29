@@ -1,0 +1,9 @@
+*.conf
+*.key
+*.psk
+*.pem
+*.bak
+.env*
+!*.example
+__pycache__/
+.DS_Store
