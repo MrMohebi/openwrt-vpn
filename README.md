@@ -11,6 +11,15 @@ Create a profile for each device, scan its QR code in WireGuard, and connect
 back to your home network. Use `full` mode when you also want IPv4 internet
 traffic to leave through your home connection.
 
+Keep one simple default network, or add named networks with their own custom
+subnets and client IP pools:
+
+```sh
+vpn add phone
+vpn network add work --cidr 10.20.0.0/24 --pool 10.20.0.50-10.20.0.200
+vpn add laptop full --network work
+```
+
 This configures an incoming VPN server. It does not connect your router to a
 commercial VPN provider.
 
@@ -33,12 +42,12 @@ Run on the **OpenWrt router**, after connecting with `ssh root@YOUR_ROUTER`:
 
 ```sh
 wget -O /tmp/install-vpn.sh \
-  https://raw.githubusercontent.com/MrMohebi/openwrt-vpn/v1.0.0/install.sh
+  https://raw.githubusercontent.com/MrMohebi/openwrt-vpn/v1.1.0/install.sh
 sh /tmp/install-vpn.sh
 ```
 
 You can inspect `/tmp/install-vpn.sh` before running it. It downloads the
-matching `v1.0.0` command over HTTPS, checks its shell syntax and version, and
+matching `v1.1.0` command over HTTPS, checks its shell syntax and version, and
 installs it as `/usr/bin/vpn`. It installs `kmod-wireguard`, `wireguard-tools`,
 and `qrencode` using your router's configured OpenWrt package feeds. It does
 not perform a blanket package upgrade.
@@ -106,15 +115,147 @@ For a custom port and subnet:
 
 ```sh
 vpn setup --endpoint vpn.example.com --lan 192.168.50.0/24 \
-  --port 41000 --subnet 10.44.0 --interface wg_home
+  --port 41000 --cidr 10.44.0.0/24 --interface wg_home
 ```
 
 Pass `--lan-zone HOME` or `--wan-zone INTERNET` if your firewall zones have
-different names. This version supports one managed server, an RFC1918 IPv4
-`/24` VPN subnet, and an IPv4/DNS endpoint. IPv6 endpoint literals are unsupported.
+different names. Each network uses an RFC1918 private IPv4 subnet with enough
+space for a router and at least one client (`/30` or larger). IPv4/DNS endpoints
+are supported; IPv6 endpoint literals are unsupported. The legacy
+`--subnet 10.44.0` shorthand still means `--cidr 10.44.0.0/24`.
 Choose a VPN subnet that does not overlap any local, upstream, or remote network.
-The script detects overlap with the supplied LAN and configured CIDR addresses;
+The script detects overlap with the supplied LAN, other configured interface
+CIDRs, and static interface addresses with netmasks;
 it cannot discover every network used by a remote device or upstream router.
+
+## Custom IP ranges and multiple networks
+
+`--cidr` defines the entire network; `--pool` optionally limits the addresses
+that can be assigned to clients. They serve different purposes:
+
+```sh
+vpn network add work --cidr 10.20.0.0/24 \
+  --pool 10.20.0.50-10.20.0.200
+```
+
+For this example:
+
+| Setting | Address/range |
+| --- | --- |
+| Network | `10.20.0.0/24` |
+| Router address and client DNS | `10.20.0.1` |
+| Automatic client addresses | `10.20.0.50` through `10.20.0.200`, inclusive |
+| Reserved | Network address, router address, broadcast address |
+
+The router always uses the first usable address. With no `--pool`, clients can
+use every remaining usable address, starting at the second usable address.
+Noncanonical CIDRs are normalized and shown in the setup plan; add `--dry-run`
+to preview the exact subnet, router address, pool, port, and interface.
+
+### Keep the default simple
+
+The original commands continue to use the **default** network:
+
+```sh
+vpn setup --endpoint vpn.example.com --lan 192.168.1.0/24
+vpn add phone
+vpn add laptop full
+vpn list
+```
+
+To customize the default during its initial setup:
+
+```sh
+vpn setup --endpoint vpn.example.com --lan 192.168.1.0/24 \
+  --cidr 10.10.0.0/24 --pool 10.10.0.100-10.10.0.200
+```
+
+Already configured networks are never silently renumbered. To move devices to
+a different subnet or pool, create a new named network and import new client
+profiles. `vpn setup` does not edit an existing default network.
+
+### Add more networks
+
+```sh
+vpn network add work --cidr 10.20.0.0/24
+vpn network add lab --cidr 10.30.0.0/23 --pool 10.30.0.50-10.30.1.200
+vpn network list
+vpn network show lab
+```
+
+First configure the default network. New networks inherit its endpoint, home
+LAN, and firewall zone names. Each new network gets an independent server key,
+a free interface name (`wg_vpn1`, `wg_vpn2`, ...), and an available configured
+UDP port, starting above the default's port. Ports used by configured interfaces
+are skipped; unrelated UDP services are not automatically detected. Override
+settings with the same options supported by `vpn setup`:
+
+```sh
+vpn network add office --cidr 10.50.0.0/24 \
+  --port 51830 --interface wg_office --endpoint office-vpn.example.com
+```
+
+If another router is upstream, **forward each network's UDP port** to OpenWrt.
+Check `vpn network list` for the actual ports. Additional networks have separate
+addresses and WireGuard interfaces; **they share the trusted LAN access policy**
+by default. This does not isolate work, lab, or other VPN devices from each
+other. Configure firewall zones/rules separately when you need isolation.
+
+### Assign clients to a network
+
+```sh
+vpn add phone --network work
+vpn add laptop full --network work
+vpn add camera --network lab --ip 10.30.0.60
+vpn show phone --network work
+vpn list --network work
+vpn status --network work
+vpn endpoint new-vpn.example.com --network work
+vpn remove phone --network work
+```
+
+`-n work` is a short form of `--network work`. Client names are scoped to each
+network, so `phone` can exist in both default and work. Every client uses its
+selected network's server key, endpoint, port, router/DNS address, and routes.
+`--ip` requests a specific unused address **inside that network's client pool**;
+automatic allocation skips it. Exhausted pools and overlapping reservations
+are rejected, including addresses/ranges on manually configured peers of that
+interface. A freed address can be reused after the old profile is revoked.
+
+Export a named network's client from your computer:
+
+```sh
+umask 077
+ssh -T root@YOUR_ROUTER 'vpn export laptop --network work' > work-laptop.conf
+```
+
+Default profiles keep their original path, `/etc/wireguard/clients/NAME.conf`.
+Named network profiles use `/etc/wireguard/clients/NETWORK/NAME.conf`.
+Endpoint updates and client removals affect only the selected network, and
+client changes restart only its WireGuard interface.
+
+### Remove an empty network
+
+Revoke its clients first, then remove it:
+
+```sh
+vpn remove laptop --network work
+vpn network remove work
+```
+
+Removal refuses a network with saved profiles or any remaining peers. It removes
+only that named network's interface, manager settings, firewall rules, and LAN
+zone membership. The default network is retained. Shared zone settings, such as
+WAN masquerading, remain enabled; restore a pre-setup backup if you want the
+original zone policy back.
+
+### Upgrade from v1.0
+
+Run the v1.1 installer. Existing `vpn.server` settings, `--subnet` values,
+default client filenames, and peer section names are read as the default
+network without changing keys or re-exporting profiles. You can then add named
+networks. Installing the manager does not import an unrelated custom WireGuard
+server or the earlier standalone `wg-client` script's configuration.
 
 ### What setup changes
 
@@ -130,11 +271,11 @@ it cannot discover every network used by a remote device or upstream router.
   `/etc/config/network`, and firewall changes in `/etc/config/firewall`.
 - Reloads network configuration and the firewall, then starts the new interface.
 
-Setup refuses an existing target interface, an existing manager configuration,
+Setup refuses an existing target interface, an existing target network,
 conflicting managed firewall section names, and pending UCI changes in packages
 it would commit. It does not adopt/import an existing WireGuard server or its
-profiles. For an existing server, keep its current manager, migrate manually,
-or choose a new interface **and a nonoverlapping subnet** for this tool.
+profiles. For an unrelated existing server, keep its current manager, migrate
+manually, or choose a new interface **and a nonoverlapping subnet** for this tool.
 
 Setup and later mutations save private configuration backups in
 `/root/vpn-backups/change-*/`. Failed changes restore their configuration files
@@ -219,6 +360,13 @@ the keys; the old profile will no longer work.
 | `vpn endpoint HOST` | Change the endpoint in saved profiles |
 | `vpn remove NAME` | Revoke a managed peer and delete its active saved profile |
 | `vpn version` | Print the installed version |
+| `vpn network list` | List all networks and their ranges, ports, and interfaces |
+| `vpn network show NAME` | Show a network's settings and allocation pool |
+| `vpn network add NAME --cidr CIDR [options]` | Create a named network |
+| `vpn network remove NAME` | Remove an empty named network |
+
+Add `--network NETWORK` to client, status, list, or endpoint commands to select
+a named network. `vpn add` also accepts `--ip ADDRESS` for a fixed client IP.
 
 Adding or removing a client briefly restarts the managed WireGuard interface,
 disconnecting active VPN clients. Run those commands from LAN SSH when possible.
@@ -238,7 +386,10 @@ To update the endpoint:
 vpn endpoint new-vpn.example.com
 ```
 
-This updates the manager configuration and all profiles saved on the router.
+This updates the selected network's manager settings and saved profiles. With
+no selector it updates the default network only. Named networks inherit an
+endpoint value at creation; later default endpoint changes do not propagate to
+them automatically. Use `--network NAME` to update each one as needed.
 **Re-import the profiles on devices**, or edit their Endpoint setting yourself;
 the router cannot update a profile already imported into a client app. This
 command keeps the existing UDP port and keys.
@@ -305,7 +456,9 @@ entries from `/etc/sysupgrade.conf` if you no longer want them backed up.
 See [tests/README.md](tests/README.md). CI runs ShellCheck and integration tests
 inside disposable OpenWrt 24.10 and 25.12 rootfs containers. Tests use actual UCI
 storage, WireGuard key generation, and QR encoding; network service actions and
-kernel interface status are simulated. A real external client is required to
+kernel interface status are simulated. Checks cover v1.0 compatibility, custom
+CIDRs, pools crossing octet boundaries, fixed IPs, conflicts, pool exhaustion,
+and network selection/removal. A real external client is required to
 verify packet flow and reachability. No keys, credentials, or personal endpoint
 addresses are included in this repository.
 

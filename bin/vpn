@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: MIT
 set -eu
 umask 077
-VERSION=1.0.0
+VERSION=1.1.0
+NET_NAME=default
 LOCK=/var/lock/openwrt-vpn
 WORK=
 BACKUP=
@@ -30,7 +31,7 @@ cleanup() {
         [ -z "$NEW_PROFILE" ] || rm -f "$NEW_PROFILE"
         if [ "$PROFILE_ROLLBACK" = 1 ]; then
             for file in "$BACKUP/profiles/"*.conf; do
-                [ ! -f "$file" ] || cp -p "$file" /etc/wireguard/clients/
+                [ ! -f "$file" ] || cp -p "$file" "$DIR/"
             done
         fi
         if [ "$RUNTIME_CHANGED" = 1 ]; then
@@ -68,15 +69,33 @@ OpenWrt VPN — easy WireGuard server and client profiles
   vpn help               Show these instructions
   vpn version            Show the installed version
 
+Custom networks (the simple commands above still use 'default'):
+  vpn network add work --cidr 10.20.0.0/24
+  vpn network add lab --cidr 10.30.0.0/23 --pool 10.30.0.50-10.30.1.200
+  vpn network list
+  vpn network show work
+  vpn add laptop full --network work
+  vpn add camera --network lab --ip 10.30.0.60
+  vpn show laptop --network work
+  vpn network remove work   Remove an empty named network
+  Add --network NAME (or -n NAME) to client, status, list and endpoint commands.
+
 Setup options:
   --endpoint HOST        Public IPv4 address or DNS hostname (required)
   --lan CIDR             Home LAN, for example 192.168.1.0/24 (required)
   --port PORT            UDP listen/endpoint port (default: 51820)
-  --subnet A.B.C          VPN /24 prefix (default: 10.7.0; server is .1)
+  --cidr CIDR            Private IPv4 subnet (default: 10.7.0.0/24)
+  --pool FIRST-LAST      Optional client range within that subnet
+  --subnet A.B.C         Legacy /24 shorthand, e.g. --subnet 10.7.0
   --interface NAME       New WireGuard interface (default: wg0)
   --lan-zone NAME        Existing trusted firewall zone (default: lan)
   --wan-zone NAME        Existing internet firewall zone (default: wan)
   --dry-run              Validate and print the plan without making changes
+
+Named networks inherit endpoint, LAN and zones from default; each gets its own
+key, interface and available UDP port. Pass setup options to override them.
+For each subnet, the first usable address is the router/DNS; clients start at
+the second usable address. Network, router and broadcast addresses are reserved.
 
 Phone: run 'vpn add phone', then scan the QR in the WireGuard app.
 Laptop: run 'vpn add laptop full', then run this on your COMPUTER:
@@ -88,7 +107,8 @@ lan (default): only VPN and home-network routes use the tunnel. DNS uses home.
 full: IPv4 internet uses home. IPv6 stays outside the tunnel.
 VPN clients are trusted LAN members and can reach router services.
 Adding/removing a client briefly restarts the VPN interface.
-Private profile files: /etc/wireguard/clients/NAME.conf. Do not share them.
+Default profiles: /etc/wireguard/clients/NAME.conf; named profiles: NETWORK/NAME.conf.
+Separate address ranges do not create firewall isolation between VPN networks.
 Test outside access from mobile data and check 'vpn status' for a handshake.
 If behind another router, forward the chosen UDP port to this router's WAN IP.
 Full guide: https://github.com/MrMohebi/openwrt-vpn#readme
@@ -123,6 +143,43 @@ overlaps() {
         s=2^(32-c[2]); r[1]=int(n/s)*s; r[2]=r[1]+s-1;
     } BEGIN { bounds(first,a); bounds(second,b); exit !(a[1]<=b[2] && b[1]<=a[2]); }'
 }
+ip_number() {
+    value=$(cidr "$1/32") || return 1
+    awk -v value="${value%/*}" 'BEGIN { split(value,a,"."); printf "%.0f\n",((a[1]*256+a[2])*256+a[3])*256+a[4]; }'
+}
+ip_text() {
+    awk -v n="$1" 'BEGIN { printf "%d.%d.%d.%d\n",int(n/16777216),int(n/65536)%256,int(n/256)%256,n%256; }'
+}
+geometry() {
+    base=$(ip_number "${NET_CIDR%/*}")
+    bits=${NET_CIDR#*/}
+    size=$(awk -v bits="$bits" 'BEGIN { printf "%.0f\n",2^(32-bits); }')
+    GATEWAY=$(ip_text "$((base+1))")
+    FIRST=$((base+2))
+    LAST=$((base+size-2))
+}
+pool_values() {
+    geometry
+    POOL_START=${POOL_START:-$(ip_text "$FIRST")}
+    POOL_END=${POOL_END:-$(ip_text "$LAST")}
+    START_NUM=$(ip_number "$POOL_START") || die 'Invalid first pool address.'
+    END_NUM=$(ip_number "$POOL_END") || die 'Invalid last pool address.'
+    [ "$START_NUM" -ge "$FIRST" ] || die 'Pool must exclude the network and router addresses.'
+    [ "$END_NUM" -le "$LAST" ] || die 'Pool must exclude the broadcast address and stay inside its subnet.'
+    [ "$START_NUM" -le "$END_NUM" ] || die 'Pool start must not exceed its end.'
+}
+escaped() { printf '%s' "$1" | sed 's/_/_u/g;s/-/_h/g'; }
+network_config() {
+    name_ok "$NET_NAME"
+    if [ "$NET_NAME" = default ]; then
+        CONFIG=server; INPUT_SECTION=wg_vpn_input; FORWARD_SECTION=wg_vpn_forward
+        DIR=/etc/wireguard/clients
+    else
+        encoded=$(escaped "$NET_NAME")
+        CONFIG="net_$encoded"; INPUT_SECTION="wg_vpn_input_n_$encoded"; FORWARD_SECTION="wg_vpn_forward_n_$encoded"
+        DIR="/etc/wireguard/clients/$NET_NAME"
+    fi
+}
 require_router() {
     [ "$(id -u)" = 0 ] || die 'Run as root on your OpenWrt router.'
     [ -f /etc/openwrt_release ] || die 'This tool runs on OpenWrt.'
@@ -150,17 +207,31 @@ begin() {
 commit() { for package in $PACKAGES; do uci commit "$package" || return 1; done; }
 done_change() { ROLLBACK=0; PROFILE_ROLLBACK=0; echo "Backup: $BACKUP"; }
 load() {
+    NET_NAME=${1:-default}
+    network_config
     require_router
-    IFACE=$(uci -q get vpn.server.interface) || die 'Run vpn setup first.'
-    PREFIX=$(uci get vpn.server.subnet)
-    LAN=$(uci get vpn.server.lan)
-    ENDPOINT=$(uci get vpn.server.endpoint)
-    PORT=$(uci get vpn.server.port)
-    DIR=/etc/wireguard/clients
+    IFACE=$(uci -q get "vpn.$CONFIG.interface") || die "Network '$NET_NAME' does not exist. Run vpn setup or vpn network add."
+    NET_CIDR=$(uci -q get "vpn.$CONFIG.cidr") || NET_CIDR="$(uci get "vpn.$CONFIG.subnet").0/24"
+    LAN=$(uci get "vpn.$CONFIG.lan")
+    ENDPOINT=$(uci get "vpn.$CONFIG.endpoint")
+    PORT=$(uci get "vpn.$CONFIG.port")
+    POOL_START=$(uci -q get "vpn.$CONFIG.pool_start") || POOL_START=
+    POOL_END=$(uci -q get "vpn.$CONFIG.pool_end") || POOL_END=
+    pool_values
+    LAN_ZONE=$(uci -q get "vpn.$CONFIG.lan_zone") || LAN_ZONE=
+    if [ -z "$LAN_ZONE" ]; then
+        for zone in $(uci show firewall | sed -n 's/^firewall\.\([^=]*\)=zone$/\1/p'); do
+            for member in $(uci -q get "firewall.$zone.network"); do
+                [ "$member" != "$IFACE" ] || LAN_ZONE=$(uci get "firewall.$zone.name")
+            done
+        done
+        LAN_ZONE=${LAN_ZONE:-lan}
+    fi
+    WAN_ZONE=$(uci -q get "vpn.$CONFIG.wan_zone") || WAN_ZONE=$(uci -q get "firewall.$INPUT_SECTION.src") || WAN_ZONE=wan
 }
 restart_vpn() {
     RUNTIME_CHANGED=1
-    ifdown "$IFACE"
+    ifdown "$IFACE" || true
     count=0
     while wg show "$IFACE" >/dev/null 2>&1; do
         count=$((count+1)); [ "$count" -lt 15 ] || die "Could not stop $IFACE."
@@ -180,91 +251,139 @@ zone_section() {
     return 1
 }
 setup() {
-    HOST=; LAN=; PORT=51820; PREFIX=10.7.0; IFACE=wg0; LAN_ZONE=lan; WAN_ZONE=wan; DRY=0
+    selected=$NET_NAME
+    HOST=; LAN=; PORT=51820; IFACE=wg0; LAN_ZONE=lan; WAN_ZONE=wan
+    if [ "$selected" != default ]; then
+        load default
+        HOST=$ENDPOINT
+        PORT=; IFACE=
+    fi
+    NET_NAME=$selected
+    network_config
+    RANGE=10.7.0.0/24; POOL=; DRY=0; RANGE_SET=0
     [ "$#" -gt 0 ] || { help; return; }
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --dry-run) DRY=1; shift; continue;;
             -h|--help) help; return;;
-            --endpoint|--lan|--port|--subnet|--interface|--lan-zone|--wan-zone)
+            --endpoint|--lan|--port|--subnet|--cidr|--pool|--interface|--lan-zone|--wan-zone)
                 [ "$#" -ge 2 ] || die "Missing value for $1.";;
             *) die "Unknown setup option: $1";;
         esac
         case "$1" in
-            --endpoint) HOST=$2;; --lan) LAN=$2;; --port) PORT=$2;; --subnet) PREFIX=$2;;
+            --endpoint) HOST=$2;; --lan) LAN=$2;; --port) PORT=$2;;
+            --cidr) RANGE=$2; RANGE_SET=1;;
+            --subnet)
+                case "$2" in */*) RANGE=$2;; *) RANGE="$2.0/24";; esac
+                RANGE_SET=1;;
+            --pool) POOL=$2;;
             --interface) IFACE=$2;; --lan-zone) LAN_ZONE=$2;; --wan-zone) WAN_ZONE=$2;;
         esac
         shift 2
     done
+    if [ "$NET_NAME" != default ] && [ "$RANGE_SET" = 0 ]; then die 'Named networks require --cidr CIDR.'; fi
     host_ok "$HOST"
     LAN=$(cidr "$LAN") || die 'Provide --lan with a valid IPv4 CIDR.'
+    NET_CIDR=$(cidr "$RANGE") || die 'Provide a valid IPv4 --cidr, such as 10.20.0.0/24.'
+    bits=${NET_CIDR#*/}
+    [ "$bits" -le 30 ] || die 'VPN subnet must have room for the router and at least one client (/30 or larger).'
+    private=0
+    for block in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16; do
+        if [ "$bits" -ge "${block#*/}" ] && overlaps "$NET_CIDR" "$block"; then private=1; fi
+    done
+    [ "$private" = 1 ] || die 'Use an RFC1918 private VPN subnet.'
+    POOL_START=; POOL_END=
+    if [ -n "$POOL" ]; then
+        case "$POOL" in *-*) POOL_START=${POOL%-*}; POOL_END=${POOL#*-};; *) die 'Pool must be FIRST-LAST, e.g. 10.20.0.50-10.20.0.200.';; esac
+        [ -n "$POOL_START" ] || die 'Pool needs both start and end addresses.'
+        [ -n "$POOL_END" ] || die 'Pool needs both start and end addresses.'
+    fi
+    pool_values
+    overlaps "$NET_CIDR" "$LAN" && die 'VPN subnet overlaps the home LAN.'
+    require_router
+    # Hold the global mutation lock during conflict detection and all writes.
+    [ "$DRY" = 1 ] || begin network firewall vpn
+    uci -q get "vpn.$CONFIG" >/dev/null && die "Network '$NET_NAME' is already configured. Use vpn endpoint HOST --network $NET_NAME to change its public address."
+    if [ -z "$IFACE" ]; then
+        index=1
+        while uci -q get "network.wg_vpn$index" >/dev/null; do index=$((index+1)); done
+        IFACE="wg_vpn$index"
+    fi
+    case "$IFACE" in ''|*[!a-zA-Z0-9_]*) die 'Interface may contain letters, numbers and underscores only.';; esac
+    [ "${#IFACE}" -le 15 ] || die 'Interface is too long.'
+    uci -q get "network.$IFACE" >/dev/null && die "Interface $IFACE already exists; choose another --interface. Existing VPNs are never overwritten."
+    ports=$(uci show network | sed -n "s/^network\..*\.listen_port='\([0-9]*\)'$/\1/p")
+    if [ -z "$PORT" ]; then
+        PORT=$(uci get vpn.server.port)
+        PORT=$((PORT+1))
+        [ "$PORT" -le 65535 ] || PORT=1024
+        while printf '%s\n' "$ports" | grep -qxF "$PORT"; do
+            PORT=$((PORT+1)); [ "$PORT" -le 65535 ] || die 'No automatic UDP port remains. Pass --port PORT.'
+        done
+    fi
     case "$PORT" in ''|*[!0-9]*|0*) die 'Port must be 1 to 65535, without leading zeros.';; esac
     [ "${#PORT}" -le 5 ] || die 'Port must be 1 to 65535.'
     [ "$PORT" -le 65535 ] || die 'Port must be 1 to 65535.'
-    case "$IFACE" in ''|*[!a-zA-Z0-9_]*) die 'Interface may contain letters, numbers and underscores only.';; esac
-    [ "${#IFACE}" -le 15 ] || die 'Interface is too long.'
-    VPN_NET=$(cidr "$PREFIX.0/24") || die 'Subnet must be a three-octet IPv4 prefix, such as 10.7.0.'
-    case "$PREFIX" in
-        10.*|192.168.*) :;;
-        172.*)
-            second=$(echo "$PREFIX" | cut -d . -f 2)
-            [ "$second" -ge 16 ] || die 'Use an RFC1918 private VPN subnet.'
-            [ "$second" -le 31 ] || die 'Use an RFC1918 private VPN subnet.';;
-        *) die 'Use an RFC1918 private VPN subnet.';;
-    esac
-    overlaps "$VPN_NET" "$LAN" && die 'VPN subnet overlaps the home LAN.'
-    require_router
-    uci -q get vpn.server >/dev/null && die 'Already configured. Use vpn endpoint HOST to change the public address.'
-    uci -q get "network.$IFACE" >/dev/null && die "Interface $IFACE already exists; choose another --interface. Existing VPNs are never overwritten."
+    if printf '%s\n' "$ports" | grep -qxF "$PORT"; then die "UDP port $PORT is already configured on another interface."; fi
     LAN_SECTION=$(zone_section "$LAN_ZONE") || die "Firewall zone $LAN_ZONE does not exist."
     WAN_SECTION=$(zone_section "$WAN_ZONE") || die "Firewall zone $WAN_ZONE does not exist."
     [ "$LAN_SECTION" != "$WAN_SECTION" ] || die 'LAN and WAN zones must differ.'
-    for section in wg_vpn_input wg_vpn_forward; do
+    for section in "$INPUT_SECTION" "$FORWARD_SECTION"; do
         uci -q get "firewall.$section" >/dev/null && die "Firewall section $section already exists."
     done
-    # Refuse overlap with every other configured IPv4 interface, including WAN.
-    for address in $(uci show network | sed -n "s/.*\.addresses='\([^']*\)'.*/\1/p; s/.*\.ipaddr='\([^']*\/[^']*\)'.*/\1/p"); do
-        other=$(cidr "$address") || continue
-        overlaps "$VPN_NET" "$other" && die "VPN subnet overlaps existing interface address $address."
+    # Check all values of address lists and static IPv4/netmask configurations.
+    for section in $(uci show network | sed -n 's/^network\.\([^=]*\)=interface$/\1/p'); do
+        for address in $(uci -q get "network.$section.addresses") $(uci -q get "network.$section.ipaddr"); do
+            case "$address" in
+                */*) other=$(cidr "$address") || continue;;
+                *)
+                    mask=$(uci -q get "network.$section.netmask") || mask=255.255.255.255
+                    mask_bits=$(mask_prefix "$mask") || die "Invalid netmask on interface $section."
+                    other=$(cidr "$address/$mask_bits") || continue;;
+            esac
+            overlaps "$NET_CIDR" "$other" && die "VPN subnet overlaps existing interface $section ($other)."
+        done
     done
-    printf 'Create %s (%s.1/24), endpoint %s:%s UDP\nLAN %s; trust zone %s; internet zone %s\n' "$IFACE" "$PREFIX" "$HOST" "$PORT" "$LAN" "$LAN_ZONE" "$WAN_ZONE"
+    print_network
     [ "$DRY" = 0 ] || { echo 'Dry run: no changes made.'; return; }
-    begin network firewall vpn
     private=$(wg genkey)
     printf '%s\n' "$private" | wg pubkey >/dev/null
     uci set "network.$IFACE=interface"
     uci set "network.$IFACE.proto=wireguard"
     uci set "network.$IFACE.private_key=$private"
     uci set "network.$IFACE.listen_port=$PORT"
-    uci add_list "network.$IFACE.addresses=$PREFIX.1/24"
+    uci add_list "network.$IFACE.addresses=$GATEWAY/$bits"
     uci add_list "firewall.$LAN_SECTION.network=$IFACE"
     uci set "firewall.$WAN_SECTION.masq=1"
-    uci set firewall.wg_vpn_input=rule
-    uci set firewall.wg_vpn_input.name=Allow-WireGuard-VPN
-    uci set "firewall.wg_vpn_input.src=$WAN_ZONE"
-    uci set firewall.wg_vpn_input.proto=udp
-    uci set "firewall.wg_vpn_input.dest_port=$PORT"
-    uci set firewall.wg_vpn_input.target=ACCEPT
-    uci set firewall.wg_vpn_input.family=ipv4
-    forward=0
-    for section in $(uci show firewall | sed -n 's/^firewall\.\([^=]*\)=forwarding$/\1/p'); do
-        if [ "$(uci -q get "firewall.$section.src")" = "$LAN_ZONE" ] && [ "$(uci -q get "firewall.$section.dest")" = "$WAN_ZONE" ]; then forward=1; fi
-    done
-    if [ "$forward" = 0 ]; then
-        uci set firewall.wg_vpn_forward=forwarding
-        uci set "firewall.wg_vpn_forward.src=$LAN_ZONE"
-        uci set "firewall.wg_vpn_forward.dest=$WAN_ZONE"
-    fi
-    # UCI cannot create a previously nonexistent package with `set` alone.
+    uci set "firewall.$INPUT_SECTION=rule"
+    uci set "firewall.$INPUT_SECTION.name=Allow-WireGuard-$NET_NAME"
+    uci set "firewall.$INPUT_SECTION.src=$WAN_ZONE"
+    uci set "firewall.$INPUT_SECTION.proto=udp"
+    uci set "firewall.$INPUT_SECTION.dest_port=$PORT"
+    uci set "firewall.$INPUT_SECTION.target=ACCEPT"
+    uci set "firewall.$INPUT_SECTION.family=ipv4"
+    # Each network owns its forwarding rule, so removing one cannot break another.
+    uci set "firewall.$FORWARD_SECTION=forwarding"
+    uci set "firewall.$FORWARD_SECTION.src=$LAN_ZONE"
+    uci set "firewall.$FORWARD_SECTION.dest=$WAN_ZONE"
     [ -f /etc/config/vpn ] || : > /etc/config/vpn
-    uci set vpn.server=server
-    uci set "vpn.server.interface=$IFACE"
-    uci set "vpn.server.subnet=$PREFIX"
-    uci set "vpn.server.lan=$LAN"
-    uci set "vpn.server.endpoint=$HOST"
-    uci set "vpn.server.port=$PORT"
-    mkdir -p /etc/wireguard/clients
-    chmod 700 /etc/wireguard /etc/wireguard/clients
+    uci set "vpn.$CONFIG=server"
+    uci set "vpn.$CONFIG.name=$NET_NAME"
+    uci set "vpn.$CONFIG.interface=$IFACE"
+    uci set "vpn.$CONFIG.cidr=$NET_CIDR"
+    if [ "$bits" = 24 ]; then
+        legacy_prefix=${NET_CIDR%/*}
+        uci set "vpn.$CONFIG.subnet=${legacy_prefix%.*}"
+    fi
+    uci set "vpn.$CONFIG.pool_start=$POOL_START"
+    uci set "vpn.$CONFIG.pool_end=$POOL_END"
+    uci set "vpn.$CONFIG.lan=$LAN"
+    uci set "vpn.$CONFIG.endpoint=$HOST"
+    uci set "vpn.$CONFIG.port=$PORT"
+    uci set "vpn.$CONFIG.lan_zone=$LAN_ZONE"
+    uci set "vpn.$CONFIG.wan_zone=$WAN_ZONE"
+    mkdir -p "$DIR"
+    chmod 700 /etc/wireguard /etc/wireguard/clients "$DIR"
     commit
     RUNTIME_CHANGED=1
     /etc/init.d/network reload
@@ -276,12 +395,65 @@ setup() {
         sleep 1
     done
     done_change
-    echo 'Server ready. Next: vpn add phone'
+    if [ "$NET_NAME" = default ]; then echo 'Server ready. Next: vpn add phone'
+    else echo "Network ready. Next: vpn add phone --network $NET_NAME"; fi
 }
+mask_prefix() {
+    awk -v mask="$1" 'BEGIN {
+        if(split(mask,a,".")!=4) exit 1;
+        n=0; ended=0;
+        for(i=1;i<=4;i++) {
+            if(a[i]!~/^[0-9]+$/ || a[i]>255) exit 1;
+            for(b=128;b>=1;b/=2) {
+                bit=int(a[i]/b)%2;
+                if(bit && ended) exit 1;
+                if(bit) n++; else ended=1;
+            }
+        }
+        print n;
+    }'
+}
+print_network() {
+    printf 'Network: %s\nSubnet: %s\nRouter/DNS: %s\nClient pool: %s-%s\nInterface: %s\nEndpoint: %s:%s (UDP)\nHome LAN: %s\nFirewall zones: %s -> %s\n' \
+        "$NET_NAME" "$NET_CIDR" "$GATEWAY" "$POOL_START" "$POOL_END" "$IFACE" "$HOST" "$PORT" "$LAN" "$LAN_ZONE" "$WAN_ZONE"
+}
+network_list() {
+    require_router
+    printf '%-18s %-19s %-32s %-6s %s\n' NETWORK SUBNET POOL PORT INTERFACE
+    for config in $(uci -q show vpn | sed -n 's/^vpn\.\([^=]*\)=server$/\1/p'); do
+        network=$(uci -q get "vpn.$config.name") || network=default
+        load "$network"
+        printf '%-18s %-19s %-32s %-6s %s\n' "$NET_NAME" "$NET_CIDR" "$POOL_START-$POOL_END" "$PORT" "$IFACE"
+    done
+}
+network_remove() {
+    [ "$NET_NAME" != default ] || die 'Keep the default network; only empty named networks can be removed.'
+    begin network firewall vpn
+    load "$NET_NAME"
+    for file in "$DIR/"*.conf; do [ ! -f "$file" ] || die 'Remove clients first: vpn remove NAME --network NETWORK'; done
+    peers=$(uci show network | sed -n "s/^network\.\([^=]*\)=wireguard_$IFACE$/\1/p")
+    [ -z "$peers" ] || die 'This network still has peers; remove them first.'
+    LAN_SECTION=$(zone_section "$LAN_ZONE") || die "Firewall zone $LAN_ZONE does not exist."
+    uci delete "network.$IFACE"
+    uci -q del_list "firewall.$LAN_SECTION.network=$IFACE" || true
+    uci delete "firewall.$INPUT_SECTION"
+    uci -q delete "firewall.$FORWARD_SECTION" || true
+    uci delete "vpn.$CONFIG"
+    commit
+    RUNTIME_CHANGED=1
+    ifdown "$IFACE" || true
+    /etc/init.d/network reload
+    /etc/init.d/firewall reload
+    done_change
+    rmdir "$DIR" 2>/dev/null || true
+    echo "Removed empty network '$NET_NAME'."
+}
+
 section_for() {
     # Escape underscores before hyphens so phone-a and phone_a stay distinct.
     # sed is available in OpenWrt BusyBox; od is not included in every image.
-    printf 'vpn_%s' "$(printf '%s' "$1" | sed 's/_/_u/g;s/-/_h/g')"
+    if [ "$NET_NAME" = default ]; then printf 'vpn_%s' "$(escaped "$1")"
+    else printf 'vpnnet_%s_c_%s' "$(escaped "$NET_NAME")" "$(escaped "$1")"; fi
 }
 profile() {
     name_ok "$1"
@@ -294,18 +466,23 @@ qr() {
 }
 add() {
     NAME=$1; MODE=${2:-lan}; name_ok "$NAME"
-    case "$MODE" in lan) ALLOWED="$PREFIX.0/24, $LAN";; full) ALLOWED=0.0.0.0/0;; *) die 'Mode must be lan or full.';; esac
+    case "$MODE" in lan|full) :;; *) die 'Mode must be lan or full.';; esac
     begin network
+    load "$NET_NAME"
+    case "$MODE" in lan) ALLOWED="$NET_CIDR, $LAN";; full) ALLOWED=0.0.0.0/0;; esac
     SECTION=$(section_for "$NAME")
     FILE="$DIR/$NAME.conf"
     [ ! -e "$FILE" ] || die "Client '$NAME' already exists."
     uci -q get "network.$SECTION" >/dev/null && die "Client '$NAME' already exists."
-    # Include manually configured peers and all addresses in each UCI list.
-    used="$(uci show network | sed -n "/^network\..*\.allowed_ips=/p" | tr "' " '\n')"
-    host=2
-    while printf '%s\n' "$used" | grep -qxF "$PREFIX.$host/32"; do
-        host=$((host+1)); [ "$host" -le 254 ] || die 'No client addresses remain.'
-    done
+    first=$START_NUM; last=$END_NUM
+    if [ -n "$REQUESTED_IP" ]; then
+        first=$(ip_number "$REQUESTED_IP") || die 'Invalid --ip address.'
+        [ "$first" -ge "$START_NUM" ] || die 'Requested IP is outside the selected client pool.'
+        [ "$first" -le "$END_NUM" ] || die 'Requested IP is outside the selected client pool.'
+        last=$first
+    fi
+    assigned=$(used_addresses | choose_address "$first" "$last") || die 'No available IP in the requested pool (or requested IP is already in use).'
+    CLIENT_IP=$(ip_text "$assigned")
     private=$(wg genkey)
     public=$(printf '%s\n' "$private" | wg pubkey)
     psk=$(wg genpsk)
@@ -316,8 +493,8 @@ add() {
     cat > "$WORK/profile" <<EOF
 [Interface]
 PrivateKey = $private
-Address = $PREFIX.$host/32
-DNS = $PREFIX.1
+Address = $CLIENT_IP/32
+DNS = $GATEWAY
 
 [Peer]
 PublicKey = $server_public
@@ -330,19 +507,21 @@ EOF
     uci set "network.$SECTION.description=$NAME"
     uci set "network.$SECTION.public_key=$public"
     uci set "network.$SECTION.preshared_key=$psk"
-    uci add_list "network.$SECTION.allowed_ips=$PREFIX.$host/32"
+    uci add_list "network.$SECTION.allowed_ips=$CLIENT_IP/32"
     uci set "network.$SECTION.route_allowed_ips=1"
     commit
     restart_vpn
     NEW_PROFILE=$FILE
     mv "$WORK/profile" "$FILE"
     done_change
-    echo "Created $NAME ($MODE): $PREFIX.$host. Profile: $FILE"
+    echo "Created $NAME ($MODE, network $NET_NAME): $CLIENT_IP. Profile: $FILE"
     qr
 }
 remove() {
     NAME=$1; profile "$NAME"
     begin network
+    load "$NET_NAME"
+    profile "$NAME"
     SECTION=$(section_for "$NAME")
     [ "$(uci -q get "network.$SECTION.description")" = "$NAME" ] || die 'Peer is not managed by this tool; refusing removal.'
     cp -p "$FILE" "$BACKUP/$NAME.conf"
@@ -364,10 +543,47 @@ list() {
         printf '%-24s %-18s %s\n' "$NAME" "$address" "$mode"
     done
 }
+used_addresses() {
+    for peer in $(uci show network | sed -n "s/^network\.\([^=]*\)=wireguard_$IFACE$/\1/p"); do
+        uci -q get "network.$peer.allowed_ips" || true
+    done
+    # Also reserve addresses in saved profiles if a peer was manually removed.
+    for file in "$DIR/"*.conf; do
+        [ ! -f "$file" ] || sed -n 's/^Address = //p' "$file"
+    done
+}
+choose_address() {
+    awk -v first="$1" -v last="$2" '
+    { for(f=1;f<=NF;f++) {
+        if(split($f,c,"/")>2 || split(c[1],a,".")!=4) continue;
+        bits=(c[2]=="" ? 32 : c[2]);
+        if(bits!~/^[0-9]+$/ || bits>32) continue;
+        valid=1; n=0;
+        for(i=1;i<=4;i++) {
+            if(a[i]!~/^[0-9]+$/ || a[i]>255) valid=0;
+            n=n*256+a[i];
+        }
+        if(!valid) continue;
+        size=2^(32-bits); count++; low[count]=int(n/size)*size;
+        high[count]=low[count]+size-1;
+    }}
+    END {
+        candidate=first;
+        do {
+            moved=0;
+            for(i=1;i<=count;i++) if(candidate>=low[i] && candidate<=high[i]) {
+                candidate=high[i]+1; moved=1;
+            }
+        } while(moved && candidate<=last);
+        if(candidate>last) exit 1;
+        printf "%.0f\n",candidate;
+    }'
+}
 endpoint() {
     HOST=$1; host_ok "$HOST"
     begin vpn
-    uci set "vpn.server.endpoint=$HOST"
+    load "$NET_NAME"
+    uci set "vpn.$CONFIG.endpoint=$HOST"
     mkdir "$BACKUP/profiles"
     # Back up and stage every profile before changing any existing file.
     for file in "$DIR"/*.conf; do
@@ -395,23 +611,60 @@ endpoint() {
 COMMAND=${1:-help}
 [ "$#" -eq 0 ] || shift
 case "$COMMAND" in
-    help|-h|--help) [ "$#" -eq 0 ] || die 'Usage: vpn help'; help;;
-    version|--version) [ "$#" -eq 0 ] || die 'Usage: vpn version'; echo "$VERSION";;
-    setup) setup "$@";;
+    setup) setup "$@"; exit;;
+    network)
+        ACTION=${1:-list}
+        [ "$#" -eq 0 ] || shift
+        case "$ACTION" in
+            list) [ "$#" -eq 0 ] || die 'Usage: vpn network list'; network_list;;
+            add)
+                [ "$#" -ge 1 ] || die 'Usage: vpn network add NAME --cidr CIDR [options]'
+                NET_NAME=$1; name_ok "$NET_NAME"; shift
+                [ "$NET_NAME" != default ] || die 'Use vpn setup to create the default network.'
+                [ "$#" -gt 0 ] || die 'Named networks require --cidr CIDR.'
+                setup "$@";;
+            show|remove)
+                [ "$#" -eq 1 ] || die "Usage: vpn network $ACTION NAME"
+                load "$1"
+                if [ "$ACTION" = show ]; then HOST=$ENDPOINT; print_network
+                else network_remove; fi;;
+            *) die 'Usage: vpn network list|add|show|remove';;
+        esac
+        exit;;
+esac
+# Parse selectors anywhere in everyday commands without eval or word splitting.
+POSITION1=; POSITION2=; POSITION_COUNT=0; REQUESTED_IP=
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --network|-n)
+            [ "$#" -ge 2 ] || die 'Missing network name.'
+            NET_NAME=$2; name_ok "$NET_NAME"; shift 2;;
+        --ip)
+            [ "$COMMAND" = add ] || die '--ip is only available with vpn add.'
+            [ "$#" -ge 2 ] || die 'Missing IP address.'
+            REQUESTED_IP=$2; shift 2;;
+        *)
+            POSITION_COUNT=$((POSITION_COUNT+1))
+            case "$POSITION_COUNT" in 1) POSITION1=$1;; 2) POSITION2=$1;; *) die 'Too many arguments. Run vpn help.';; esac
+            shift;;
+    esac
+done
+case "$COMMAND" in
+    help|-h|--help) [ "$POSITION_COUNT" -eq 0 ] || die 'Usage: vpn help'; help;;
+    version|--version) [ "$POSITION_COUNT" -eq 0 ] || die 'Usage: vpn version'; echo "$VERSION";;
     add)
-        [ "$#" -ge 1 ] || die 'Usage: vpn add NAME [lan|full]'
-        [ "$#" -le 2 ] || die 'Usage: vpn add NAME [lan|full]'
-        load; add "$@";;
+        [ "$POSITION_COUNT" -ge 1 ] || die 'Usage: vpn add NAME [lan|full] [--network NETWORK] [--ip IP]'
+        load "$NET_NAME"; add "$POSITION1" "${POSITION2:-lan}";;
     show|export|remove|endpoint)
-        [ "$#" -eq 1 ] || die "Usage: vpn $COMMAND NAME (endpoint takes HOST)"
-        load
+        [ "$POSITION_COUNT" -eq 1 ] || die "Usage: vpn $COMMAND NAME [--network NETWORK] (endpoint takes HOST)"
+        load "$NET_NAME"
         case "$COMMAND" in
-            show) NAME=$1; profile "$NAME"; qr;; export) profile "$1"; cat "$FILE";;
-            remove) remove "$1";; endpoint) endpoint "$1";;
+            show) NAME=$POSITION1; profile "$NAME"; qr;; export) profile "$POSITION1"; cat "$FILE";;
+            remove) remove "$POSITION1";; endpoint) endpoint "$POSITION1";;
         esac;;
     list|status)
-        [ "$#" -eq 0 ] || die "Usage: vpn $COMMAND"
-        load
+        [ "$POSITION_COUNT" -eq 0 ] || die "Usage: vpn $COMMAND [--network NETWORK]"
+        load "$NET_NAME"
         case "$COMMAND" in list) list;; status) wg show "$IFACE";; esac;;
     *) die "Unknown command '$COMMAND'. Run: vpn help";;
 esac

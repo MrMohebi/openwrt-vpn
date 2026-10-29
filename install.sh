@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 set -eu
 umask 077
-REF=v1.0.0
+REF=v1.1.0
 SOURCE=
 SKIP=0
 usage() {

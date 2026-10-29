@@ -21,6 +21,9 @@ These tests use the actual UCI parser/storage, WireGuard key generation, and QR
 encoder. Only kernel interface status and network/firewall service actions are
 simulated. They verify installation, setup, rollback, address allocation,
 profile export, revocation, endpoint updates, and rejection of unsafe input.
+They also cover legacy v1.0 settings/profiles, separate named networks and keys,
+automatic ports, custom CIDRs and allocation pools, fixed IPs, pool exhaustion,
+overlap checks, scoped updates, and removal without affecting default profiles.
 They do not prove internet reachability, DNS resolution, firewall packet flow,
 or a successful WireGuard handshake. Test those from an external device.
 
