@@ -199,11 +199,19 @@ setup() {
     host_ok "$HOST"
     LAN=$(cidr "$LAN") || die 'Provide --lan with a valid IPv4 CIDR.'
     case "$PORT" in ''|*[!0-9]*|0*) die 'Port must be 1 to 65535, without leading zeros.';; esac
-    [ "${#PORT}" -le 5 ] && [ "$PORT" -le 65535 ] || die 'Port must be 1 to 65535.'
+    [ "${#PORT}" -le 5 ] || die 'Port must be 1 to 65535.'
+    [ "$PORT" -le 65535 ] || die 'Port must be 1 to 65535.'
     case "$IFACE" in ''|*[!a-zA-Z0-9_]*) die 'Interface may contain letters, numbers and underscores only.';; esac
     [ "${#IFACE}" -le 15 ] || die 'Interface is too long.'
     VPN_NET=$(cidr "$PREFIX.0/24") || die 'Subnet must be a three-octet IPv4 prefix, such as 10.7.0.'
-    case "$PREFIX" in 10.*|192.168.*) :;; 172.*) second=$(echo "$PREFIX" | cut -d . -f 2); [ "$second" -ge 16 ] && [ "$second" -le 31 ] || die 'Use an RFC1918 private VPN subnet.';; *) die 'Use an RFC1918 private VPN subnet.';; esac
+    case "$PREFIX" in
+        10.*|192.168.*) :;;
+        172.*)
+            second=$(echo "$PREFIX" | cut -d . -f 2)
+            [ "$second" -ge 16 ] || die 'Use an RFC1918 private VPN subnet.'
+            [ "$second" -le 31 ] || die 'Use an RFC1918 private VPN subnet.';;
+        *) die 'Use an RFC1918 private VPN subnet.';;
+    esac
     overlaps "$VPN_NET" "$LAN" && die 'VPN subnet overlaps the home LAN.'
     require_router
     uci -q get vpn.server >/dev/null && die 'Already configured. Use vpn endpoint HOST to change the public address.'
@@ -390,7 +398,10 @@ case "$COMMAND" in
     help|-h|--help) [ "$#" -eq 0 ] || die 'Usage: vpn help'; help;;
     version|--version) [ "$#" -eq 0 ] || die 'Usage: vpn version'; echo "$VERSION";;
     setup) setup "$@";;
-    add) [ "$#" -ge 1 ] && [ "$#" -le 2 ] || die 'Usage: vpn add NAME [lan|full]'; load; add "$@";;
+    add)
+        [ "$#" -ge 1 ] || die 'Usage: vpn add NAME [lan|full]'
+        [ "$#" -le 2 ] || die 'Usage: vpn add NAME [lan|full]'
+        load; add "$@";;
     show|export|remove|endpoint)
         [ "$#" -eq 1 ] || die "Usage: vpn $COMMAND NAME (endpoint takes HOST)"
         load

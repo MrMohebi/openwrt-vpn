@@ -2,10 +2,10 @@
 # Integration tests use real OpenWrt UCI, WireGuard key generation and qrencode.
 # Only netifd/firewall reloads and kernel interface status are simulated.
 set -eu
-[ "${VPN_TEST_CONTAINER:-}" = 1 ] && [ -f /.dockerenv ] || {
+if [ "${VPN_TEST_CONTAINER:-}" != 1 ] || [ ! -f /.dockerenv ]; then
     echo 'Run only in a disposable OpenWrt Docker container; see tests/README.md.' >&2
     exit 1
-}
+fi
 SRC=${SRC:-/src}
 TEST_DIR=$(mktemp -d /tmp/vpn-tests.XXXXXX)
 mkdir "$TEST_DIR/bin"
